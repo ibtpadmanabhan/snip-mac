@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Build output
+Snip.app/
+*.app
+*.dSYM/
+build/
+.build/
+
+# Xcode / editors
+xcuserdata/
+*.xcworkspace
+.vscode/
+.idea/
+
+# Local artifacts
+*.log
+*.png
+*.local.*
+.env
