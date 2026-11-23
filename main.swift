@@ -206,12 +206,24 @@ struct Stroke {
     var highlighter: Bool
 }
 
+enum Tool: Int { case pen = 0, highlighter, eraser, crop }
+
+struct Snapshot {
+    var image: NSImage?
+    var strokes: [Stroke]
+}
+
 final class Canvas: NSView {
     static let pad: CGFloat = 28
     var image: NSImage?
     var strokes: [Stroke] = []
     var current: Stroke?
-    var highlighter = false
+    var tool: Tool = .pen
+    var history: [Snapshot] = []
+    var cropRect: NSRect?
+    var cropStart: NSPoint?
+    var erased = false
+    var onImageChanged: (() -> Void)?
     var color = NSColor.systemRed
     var width: CGFloat = 4
     var onSave: (() -> Void)?
@@ -221,12 +233,19 @@ final class Canvas: NSView {
     override var acceptsFirstResponder: Bool { true }
     override func resetCursorRects() { if image != nil { addCursorRect(bounds, cursor: .crosshair) } }
 
+    func updateFrame() {
+        setFrameSize(image.map { NSSize(width: $0.size.width + 2 * Canvas.pad, height: $0.size.height + 2 * Canvas.pad) } ?? .zero)
+        window?.invalidateCursorRects(for: self)
+    }
+
     func setImage(_ img: NSImage?) {
         image = img
         strokes = []
         current = nil
-        setFrameSize(img.map { NSSize(width: $0.size.width + 2 * Canvas.pad, height: $0.size.height + 2 * Canvas.pad) } ?? .zero)
-        window?.invalidateCursorRects(for: self)
+        history = []
+        cropRect = nil
+        cropStart = nil
+        updateFrame()
         needsDisplay = true
     }
 
@@ -234,6 +253,8 @@ final class Canvas: NSView {
         guard let image else { return }
         image.draw(in: NSRect(origin: .zero, size: image.size), from: .zero,
                    operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: NSRect(origin: .zero, size: image.size)).addClip()   // strokes never spill into the margin
         for s in strokes + (current.map { [$0] } ?? []) {
             guard let first = s.points.first else { continue }
             let path = NSBezierPath()
@@ -246,6 +267,7 @@ final class Canvas: NSView {
             (s.highlighter ? s.color.withAlphaComponent(0.4) : s.color).setStroke()
             path.stroke()
         }
+        NSGraphicsContext.restoreGraphicsState()
     }
     override func draw(_ dirtyRect: NSRect) {
         guard let image, let gc = NSGraphicsContext.current else { return }
@@ -264,6 +286,20 @@ final class Canvas: NSView {
         image.draw(in: imgRect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
         gc.restoreGraphicsState()
         drawContent()
+        if let c = cropRect {
+            let dim = NSBezierPath(rect: imgRect)
+            dim.append(NSBezierPath(rect: c))
+            dim.windingRule = .evenOdd
+            NSColor.black.withAlphaComponent(0.5).setFill()
+            dim.fill()
+            let box = NSBezierPath(rect: c)
+            box.lineWidth = 1.5
+            NSColor.white.setStroke()
+            box.stroke()
+            box.setLineDash([5, 4], count: 2, phase: 0)
+            NSColor.black.setStroke()
+            box.stroke()
+        }
         // thin outline just outside the snip
         if showOutline {
             NSColor.separatorColor.setStroke()
@@ -279,24 +315,109 @@ final class Canvas: NSView {
         let p = convert(e.locationInWindow, from: nil)
         return NSPoint(x: p.x - Canvas.pad, y: p.y - Canvas.pad)
     }
+    var imageRect: NSRect { NSRect(origin: .zero, size: image?.size ?? .zero) }
+    func clamped(_ p: NSPoint) -> NSPoint {
+        NSPoint(x: min(max(p.x, 0), imageRect.width), y: min(max(p.y, 0), imageRect.height))
+    }
+
+    func pushHistory() {
+        history.append(Snapshot(image: image, strokes: strokes))
+        if history.count > 50 { history.removeFirst() }
+    }
+
+    // Eraser: removes any stroke the cursor touches.
+    var eraserRadius: CGFloat { 6 + width * 2 }
+    func distance(_ p: NSPoint, _ a: NSPoint, _ b: NSPoint) -> CGFloat {
+        let dx = b.x - a.x, dy = b.y - a.y
+        let l2 = dx * dx + dy * dy
+        if l2 == 0 { return hypot(p.x - a.x, p.y - a.y) }
+        let t = max(0, min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2))
+        return hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy))
+    }
+    func hit(_ s: Stroke, _ p: NSPoint) -> Bool {
+        let reach = eraserRadius + (s.highlighter ? s.width * 4 : s.width) / 2
+        if s.points.count == 1 { return hypot(p.x - s.points[0].x, p.y - s.points[0].y) <= reach }
+        for i in 1..<s.points.count where distance(p, s.points[i - 1], s.points[i]) <= reach { return true }
+        return false
+    }
+    @discardableResult func erase(at p: NSPoint) -> Bool {
+        let before = strokes.count
+        strokes.removeAll { hit($0, p) }
+        let changed = strokes.count != before
+        if changed { needsDisplay = true }
+        return changed
+    }
+
+    func applyCrop(_ rect: NSRect) {
+        guard let img = image else { return }
+        let r = rect.integral.intersection(imageRect)
+        guard r.width >= 4, r.height >= 4 else { return }
+        pushHistory()
+        image = croppedImage(img, to: r)
+        strokes = strokes.map { s in
+            var t = s
+            t.points = s.points.map { NSPoint(x: $0.x - r.minX, y: $0.y - r.minY) }
+            return t
+        }
+        updateFrame()
+        onImageChanged?()
+    }
 
     override func mouseDown(with e: NSEvent) {
         guard image != nil else { return }
         window?.makeFirstResponder(self)
-        current = Stroke(points: [imagePoint(e)], color: color, width: width, highlighter: highlighter)
+        let p = imagePoint(e)
+        switch tool {
+        case .pen, .highlighter:
+            current = Stroke(points: [p], color: color, width: width, highlighter: tool == .highlighter)
+        case .eraser:
+            pushHistory()
+            erased = erase(at: p)
+        case .crop:
+            cropStart = clamped(p)
+            cropRect = NSRect(origin: cropStart!, size: .zero)
+        }
         needsDisplay = true
     }
     override func mouseDragged(with e: NSEvent) {
-        current?.points.append(imagePoint(e))
+        let p = imagePoint(e)
+        switch tool {
+        case .pen, .highlighter: current?.points.append(p)
+        case .eraser: if erase(at: p) { erased = true }
+        case .crop:
+            if let s = cropStart {
+                let q = clamped(p)
+                cropRect = NSRect(x: min(s.x, q.x), y: min(s.y, q.y), width: abs(q.x - s.x), height: abs(q.y - s.y))
+            }
+        }
         needsDisplay = true
     }
     override func mouseUp(with e: NSEvent) {
-        if let c = current { strokes.append(c) }
-        current = nil
+        switch tool {
+        case .pen, .highlighter:
+            if let c = current { pushHistory(); strokes.append(c) }
+            current = nil
+        case .eraser:
+            if !erased, !history.isEmpty { history.removeLast() }   // nothing erased: no undo step
+        case .crop:
+            let r = cropRect
+            cropRect = nil
+            cropStart = nil
+            if let r { applyCrop(r) }
+        }
         needsDisplay = true
     }
 
-    func undo() { if !strokes.isEmpty { strokes.removeLast(); needsDisplay = true } }
+    func undo() {
+        guard let snap = history.popLast() else { return }
+        let sizeChanged = snap.image?.size != image?.size
+        image = snap.image
+        strokes = snap.strokes
+        current = nil
+        updateFrame()
+        if sizeChanged { onImageChanged?() }
+        needsDisplay = true
+    }
 
     /// Full-resolution PNG (pixel size of the original capture) with annotations baked in.
     func pngData() -> Data? {
@@ -339,6 +460,31 @@ final class Canvas: NSView {
         }
         return true
     }
+}
+
+/// Returns the part of `img` inside `r` (image points, top-left origin) at full pixel resolution.
+func croppedImage(_ img: NSImage, to r: NSRect) -> NSImage {
+    let rep0 = img.representations.first
+    let pw = rep0?.pixelsWide ?? Int(img.size.width)
+    let sx = CGFloat(pw) / img.size.width
+    let ow = max(1, Int((r.width * sx).rounded())), oh = max(1, Int((r.height * sx).rounded()))
+    guard let out = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: ow, pixelsHigh: oh,
+                                     bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                     colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+          let gc = NSGraphicsContext(bitmapImageRep: out) else { return img }
+    let cg = gc.cgContext
+    cg.translateBy(x: 0, y: CGFloat(oh))
+    cg.scaleBy(x: sx, y: -sx)
+    cg.translateBy(x: -r.minX, y: -r.minY)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(cgContext: cg, flipped: true)
+    img.draw(in: NSRect(origin: .zero, size: img.size), from: .zero, operation: .sourceOver,
+             fraction: 1, respectFlipped: true, hints: nil)
+    NSGraphicsContext.restoreGraphicsState()
+    out.size = r.size
+    let res = NSImage(size: r.size)
+    res.addRepresentation(out)
+    return res
 }
 
 /// Crop-by-shape for free-form snips: pixels outside the drawn path become transparent.
@@ -394,7 +540,8 @@ final class MainController: NSObject, NSWindowDelegate {
     let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     let delayPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     let toolControl = NSSegmentedControl(
-        images: [sym("pencil.tip", "Pen"), sym("highlighter", "Highlighter")],
+        images: [sym("pencil.tip", "Pen"), sym("highlighter", "Highlighter"),
+                 sym("eraser", "Eraser"), sym("crop", "Crop")],
         trackingMode: .selectOne, target: nil, action: nil)
     let colorWell = NSColorWell()
     let widthPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -415,6 +562,7 @@ final class MainController: NSObject, NSWindowDelegate {
         window.delegate = self
         canvas.onSave = { [weak self] in self?.save() }
         canvas.onNew = { [weak self] in self?.onNew() }
+        canvas.onImageChanged = { [weak self] in self?.fitWindow() }
 
         // Left: New + mode + delay
         let newBtn = NSButton(title: " New", image: sym("plus", "New"), target: self, action: #selector(newTapped))
@@ -440,6 +588,8 @@ final class MainController: NSObject, NSWindowDelegate {
         toolControl.selectedSegment = 0
         toolControl.setToolTip("Pen", forSegment: 0)
         toolControl.setToolTip("Highlighter", forSegment: 1)
+        toolControl.setToolTip("Eraser — drag over a pen or highlighter stroke to remove it", forSegment: 2)
+        toolControl.setToolTip("Crop — drag the area to keep (undo to revert)", forSegment: 3)
         colorWell.color = .systemRed
         colorWell.target = self
         colorWell.action = #selector(colorChanged)
@@ -511,11 +661,23 @@ final class MainController: NSObject, NSWindowDelegate {
         canvas.setImage(img)
         emptyLabel.isHidden = img != nil
         imageControls.forEach { $0.isEnabled = img != nil }
+        syncToolUI()
+        fitWindow()
+    }
+
+    func fitWindow() {
+        let img = canvas.image
         let vis = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
         let w = img.map { max(640, min($0.size.width + 2 * Canvas.pad, vis.width * 0.85)) } ?? 640
         let h = img.map { 48 + max(160, min($0.size.height + 2 * Canvas.pad, vis.height * 0.8)) } ?? 380
         window.setContentSize(NSSize(width: w, height: h))
         if img != nil { window.center() }
+    }
+
+    /// Color only matters for pen and highlighter.
+    func syncToolUI() {
+        let drawing = canvas.tool == .pen || canvas.tool == .highlighter
+        colorWell.isEnabled = canvas.image != nil && drawing
     }
 
     func show() {
@@ -526,10 +688,13 @@ final class MainController: NSObject, NSWindowDelegate {
 
     @objc func newTapped() { onNew() }
     @objc func toolChanged() {
-        canvas.highlighter = toolControl.selectedSegment == 1
-        let c: NSColor = canvas.highlighter ? .systemYellow : .systemRed
-        colorWell.color = c
-        canvas.color = c
+        canvas.tool = Tool(rawValue: toolControl.selectedSegment) ?? .pen
+        switch canvas.tool {
+        case .pen: colorWell.color = .systemRed; canvas.color = .systemRed
+        case .highlighter: colorWell.color = .systemYellow; canvas.color = .systemYellow
+        default: break
+        }
+        syncToolUI()
     }
     @objc func colorChanged() { canvas.color = colorWell.color }
     @objc func widthChanged() { canvas.width = [2, 4, 8][max(0, widthPopup.indexOfSelectedItem)] }

@@ -10,7 +10,7 @@ Written in a single Swift file (AppKit), built with `swiftc` — no Xcode projec
 - **One window.** New and the mode/delay menus on the left, Copy and Save on the right.
 - **Snip modes:** Rectangle, Window (hover to highlight), Monitor (the display under your cursor), Free-form.
 - **Delay:** none, 3, 5 or 10 seconds.
-- **Markup:** pen, highlighter, color, thickness, undo.
+- **Markup & editing:** pen, highlighter, **eraser** (drag over a stroke to remove it), **crop** (drag the area to keep), color, thickness, undo.
 - **Private by default:** snips live in memory only. Closing the window discards them; nothing is written to disk unless you click **Save**.
 - **Menu bar app:** click the scissors icon to open the window, right-click for New / Quit.
 - **Global hotkey:** `Control` + `Shift` + `S`.
@@ -53,7 +53,7 @@ permission survives rebuilds; if you change the bundle identifier in `build.sh`,
 | Cancel selection | `Esc` |
 | Copy | Copy button or `⌘C` |
 | Save | Save button or `⌘S` (choose where to save) |
-| Undo last stroke | Undo button or `⌘Z` |
+| Undo (stroke, erase or crop) | Undo button or `⌘Z` |
 | Close and discard | Close the window (`⌘W`) |
 
 ## How it works
@@ -66,7 +66,7 @@ permission survives rebuilds; if you change the bundle identifier in `build.sh`,
 
 ## Known limitations
 
-- No eraser, ruler or crop yet.
+- No ruler or text tool yet. The eraser removes whole strokes (not pixels), and crop applies when you release the mouse (use undo to revert).
 - The delay runs *before* the selection overlay appears (as in Windows), but opening the overlay can dismiss open menus, so capturing transient menus is unreliable.
 - Ad-hoc signed, not notarized. Build from source rather than distributing the binary.
 
